@@ -3,6 +3,7 @@ from bs4.element import Tag
 from fractions import Fraction
 from music21 import converter, harmony, stream
 from pretty_midi import note_name_to_number
+import zipfile
 
 PITCH_ALTER_TO_SYMBOL = {'-2': 'bb', '-1': 'b', '0':'', '1': '#', '2': '##'}
 SEMITONE_TO_SYMBOL = {-1: 'b', 0: '', 1: '#'}
@@ -366,7 +367,22 @@ def get_chord_tokens(s):
 
 
 def load_MusicXML(mxml_path): 
-    soup = BeautifulSoup(open(mxml_path, encoding='utf-8'), 'lxml-xml', from_encoding='utf-8')
+    if mxml_path.lower().endswith('.mxl'):
+        with zipfile.ZipFile(mxml_path, 'r') as z:
+            xml_filename = next(
+                (name for name in z.namelist() if name.endswith('.xml') and name != 'META-INF/container.xml'), 
+                None
+            )
+            
+            if not xml_filename:
+                raise ValueError(f"There is no valid XML in {mxml_path}")
+                
+            with z.open(xml_filename) as f:
+                soup = BeautifulSoup(f, 'lxml-xml')
+                
+    else:
+        with open(mxml_path, 'r', encoding='utf-8') as f:
+            soup = BeautifulSoup(f, 'lxml-xml')
     
     # eliminate line breaks
     for tag in soup(string='\n'):
@@ -375,6 +391,7 @@ def load_MusicXML(mxml_path):
     return [part.find_all('measure') for part in soup.find_all('part')], soup
 
 def MusicXML_to_tokens(mxml_path, bar_major=True, note_name=True, tokenize_chord_symbols=True):
+
     parts, soup = load_MusicXML(mxml_path)
     assert len(parts) in (1, 2)
     
