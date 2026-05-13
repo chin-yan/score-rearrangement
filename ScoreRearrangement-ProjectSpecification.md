@@ -145,14 +145,37 @@ Score pairs are trained **bidirectionally** (easier→harder and harder→easier
 - Encoder-Decoder Transformer (PyTorch)
 - Shared token embedding for source and target
 - Difficulty conditioning via prepended `Lv.*` tokens
-- **Status: TODO**
+- Key design decisions:
+
+Shared embedding — single nn.Embedding for both encoder and decoder inputs
+Difficulty conditioning — handled entirely by prepended Lv.* tokens in the sequence; no special architecture needed inside the model
+_bool_to_additive — converts bool padding masks to float additive masks (-inf) so they're consistent with the float causal mask PyTorch generates, avoiding deprecation warnings
+forward() — teacher-forced training path (src + tgt-shifted-right → logits)
+encode() / decode_step() — separated for autoregressive inference
+greedy_decode() — batched greedy decoding used by infer.py later
+- **Status: DONE**
 
 **[2.2] `dataset_seq2seq.py`**
 - PyTorch Dataset that loads `pairs.jsonl`
 - Encodes tokens using `vocab.json`
 - Applies pitch augmentation (±2 semitones)
 - Pads and batches source/target sequences
-- **Status: TODO**
+- transpose_tokens(tokens, shift)
+    Transposes all pitch-bearing tokens by shift semitones:
+        note_* — MIDI number ± shift, back to letter name
+        key_* — circle-of-fifths shift (e.g. G major +1 → Ab major)
+        bass_* / chord_* — pitch-class rotation, quality unchanged
+- ScorePairDataset
+    Loads all 59,306 pairs from pairs.jsonl
+    Builds encoder/decoder sequences per paper Fig. 2b: src = [Dsrc, Dtgt, …, <eos>], tgt = [<sos>, Dtgt, …, <eos>]
+    On each __getitem__ randomly samples a shift from {-2,-1,0,1,2}
+- make_collate_fn(pad_id)
+    Returns a collate function that pads and splits the target into:
+        tgt_in = tgt[:-1] (decoder input, teacher-forced)
+        tgt_out = tgt[1:] (cross-entropy target)
+- make_splits(pairs_path, vocab_path)
+    Song-level train/val split so no song leaks across splits (default 5% val → ~2,100 / 57,000 pairs).
+- **Status: DONE**
 
 ---
 
@@ -163,7 +186,21 @@ Score pairs are trained **bidirectionally** (easier→harder and harder→easier
 - Teacher forcing on target sequence
 - Validation loss tracking, early stopping
 - Checkpoint saving (best model by validation loss)
-- **Status: TODO**
+- LR schedule — make_lr_lambda: linear warmup over --warmup_steps steps, then cosine decay to --min_lr
+- Training loop
+    Teacher forcing: tgt_in = tgt[:-1] → model → compared against tgt_out = tgt[1:]
+    F.cross_entropy with ignore_index=pad_id (pad positions don't contribute to loss)
+    label_smoothing=0.1 (helps regularization on a small dataset)
+    Gradient clipping at grad_clip=1.0
+    Gradient accumulation (--accum_steps, default 4) — effective batch = batch_size × accum_steps without extra VRAM
+    Per-batch tqdm bar showing running loss + current LR
+- Checkpointing
+    best.pt — saved whenever val loss improves (stores model, optimizer, scheduler state for resuming)
+    epoch_NNNN.pt — periodic snapshot every --save_every epochs (default 10)
+    train_log.csv — append-only CSV with epoch, train loss, val loss, lr, elapsed time
+- Early stopping — stops after --patience consecutive epochs (default 10) with no val improvement
+- Resuming — --resume data/checkpoints/best.pt restores full state and continues from next epoch
+- **Status: DONE**
 
 ---
 
