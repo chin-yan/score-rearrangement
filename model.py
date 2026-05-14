@@ -232,9 +232,12 @@ class ScoreRearrangementModel(nn.Module):
         eos_idx: int,
         max_len: int = 1024,
         src_key_padding_mask: torch.Tensor | None = None,
+        init_token_idx: int | None = None,
+        temperature: float = 1.0,
+        top_k: int = 0,
     ) -> list[list[int]]:
         """
-        Greedy autoregressive decoding for a batch.
+        Autoregressive decoding for a batch.
 
         Parameters
         ----------
@@ -243,10 +246,17 @@ class ScoreRearrangementModel(nn.Module):
         eos_idx : <eos> token index
         max_len : maximum number of generated tokens
         src_key_padding_mask : (batch, src_len) bool mask
+        init_token_idx : if given, force this token as the first decoder output
+            (e.g. the target difficulty Dtgt) so the model cannot predict the
+            wrong conditioning token.
+        temperature : softmax temperature for sampling (1.0 = greedy argmax
+            when top_k=0, <1 sharpens, >1 flattens the distribution).
+        top_k : if >0, sample from the top-k logits instead of taking argmax.
 
         Returns
         -------
-        List of token-index lists (one per batch item, without <sos>/<eos>).
+        List of token-index lists (one per batch item, without <sos>/<eos>
+        and without the forced init_token if one was provided).
         """
         self.eval()
         batch_size = src.size(0)
@@ -254,14 +264,32 @@ class ScoreRearrangementModel(nn.Module):
 
         memory = self.encode(src, _bool_to_additive(src_key_padding_mask))
 
-        # Start with <sos> for every item in the batch
+        # Decoder prefix: [<sos>] or [<sos>, init_token]
         tgt = torch.full((batch_size, 1), sos_idx, dtype=torch.long, device=device)
+        if init_token_idx is not None:
+            forced = torch.full((batch_size, 1), init_token_idx, dtype=torch.long, device=device)
+            tgt = torch.cat([tgt, forced], dim=1)
+
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         outputs = [[] for _ in range(batch_size)]
 
         for _ in range(max_len):
             logits = self.decode_step(tgt, memory, memory_key_padding_mask=src_key_padding_mask)
-            next_tokens = logits.argmax(dim=-1)  # (batch,)
+            # (batch, vocab_size)
+
+            if top_k > 0:
+                # Zero out all logits outside the top-k, then sample
+                scaled = logits / max(temperature, 1e-8)
+                topk_vals, _ = torch.topk(scaled, top_k, dim=-1)
+                threshold = topk_vals[:, -1].unsqueeze(-1)
+                scaled = scaled.masked_fill(scaled < threshold, float('-inf'))
+                probs = torch.softmax(scaled, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            elif temperature != 1.0:
+                probs = torch.softmax(logits / max(temperature, 1e-8), dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            else:
+                next_tokens = logits.argmax(dim=-1)  # greedy
 
             for i in range(batch_size):
                 if not finished[i]:
