@@ -34,6 +34,17 @@ Supporting metrics (also computed from tokens):
 - **Pitch width:** semitone range (highest – lowest pitch) per measure
 - **Polyphony:** max simultaneous notes per measure
 
+### Data quality findings (after initial training)
+
+PDMX "same song" pairs are user-uploaded arrangements that share a song title but may not share the same melody, key, or structure. This caused the first-round model to output piano music that sounded like a different piece entirely rather than a transformed version of the input.
+
+**Compatibility filter added to `build_pairs.py`:**
+- Same key signature required
+- Same time signature required
+- Note density ratio ≤ 3× (one arrangement cannot have 3× more notes/bar than the other)
+
+This filter removes pairs that share only a title. Fewer but higher-quality pairs are expected to produce better melody-preserving transformations.
+
 ---
 
 ## 2.1 Cross-Instrument Extension: Data Analysis
@@ -69,7 +80,7 @@ The full pipeline:
    » score_to_tokens.py   ——  tokenize to ST+ format
    » prepend {Dsrc, Dtgt}  ——  difficulty conditioning tokens
    » seq2seq model          ——  encoder-decoder Transformer
-   » strip conditioning     ——  prepend Dtgt only
+   » strip conditioning     ——  remove Dtgt prefix from output
    » tokens_to_score.py   ——  detokenize to music21 Score
 [Output MXL]
 ```
@@ -127,14 +138,18 @@ Score pairs are trained **bidirectionally** (easier→harder and harder→easier
   Output song (60 bars, Lv.1)
   ```
 
+- Compatibility filters (key/time/density matching):
+  - Same key signature — different keys almost certainly means different arrangements
+  - Same time signature — structurally incompatible otherwise
+  - Note density ratio ≤ 3× — if one arrangement has far more notes, they are likely unrelated pieces
 - Save as `pairs.jsonl`
-- **Status: DONE**
+- **Status: DONE — rerun `python build_pairs.py` to apply compatibility filter, then retrain**
 
 **[1.3] `build_vocab.py`**
 - Scan all token files to collect unique tokens
 - Add special tokens: `<pad>`, `<sos>`, `<eos>`, `Lv.1`, `Lv.2`, `Lv.3`, `Lv.4`
 - Save `vocab.json` (token → index mapping)
-- Token strings need to encode to indexs for feeding to model
+- Token strings need to encode to indexes for feeding to model
 - **Status: DONE**
 
 ---
@@ -146,13 +161,15 @@ Score pairs are trained **bidirectionally** (easier→harder and harder→easier
 - Shared token embedding for source and target
 - Difficulty conditioning via prepended `Lv.*` tokens
 - Key design decisions:
-
-Shared embedding — single nn.Embedding for both encoder and decoder inputs
-Difficulty conditioning — handled entirely by prepended Lv.* tokens in the sequence; no special architecture needed inside the model
-_bool_to_additive — converts bool padding masks to float additive masks (-inf) so they're consistent with the float causal mask PyTorch generates, avoiding deprecation warnings
-forward() — teacher-forced training path (src + tgt-shifted-right → logits)
-encode() / decode_step() — separated for autoregressive inference
-greedy_decode() — batched greedy decoding used by infer.py later
+    - Shared embedding — single nn.Embedding for both encoder and decoder inputs
+    - Difficulty conditioning — handled entirely by prepended Lv.* tokens in the sequence; no special architecture needed inside the model
+    - `_bool_to_additive` — converts bool padding masks to float additive masks (-inf) so they're consistent with the float causal mask PyTorch generates, avoiding deprecation warnings
+    - `forward()` — teacher-forced training path (src + tgt-shifted-right → logits)
+    - `encode()` / `decode_step()` — separated for autoregressive inference
+    - `greedy_decode()` — batched decoding used by `infer.py`:
+        - `init_token_idx` — forces Dtgt as the first decoder output token (prevents the model from predicting the wrong difficulty level)
+        - `temperature` — softmax temperature for sampling (>1 adds variety, <1 sharpens)
+        - `top_k` — if >0, samples from top-k logits instead of argmax, breaking repetitive collapse
 - **Status: DONE**
 
 **[2.2] `dataset_seq2seq.py`**
@@ -160,21 +177,21 @@ greedy_decode() — batched greedy decoding used by infer.py later
 - Encodes tokens using `vocab.json`
 - Applies pitch augmentation (±2 semitones)
 - Pads and batches source/target sequences
-- transpose_tokens(tokens, shift)
+- `transpose_tokens(tokens, shift)`
     - Transposes all pitch-bearing tokens by shift semitones:
-        - note_* — MIDI number ± shift, back to letter name
-        - key_* — circle-of-fifths shift (e.g. G major +1 → Ab major)
-        - bass_* / chord_* — pitch-class rotation, quality unchanged
-- ScorePairDataset
-    - Loads all 59,306 pairs from pairs.jsonl
-    - Builds encoder/decoder sequences per paper Fig. 2b: src = [Dsrc, Dtgt, …, <eos>], tgt = [<sos>, Dtgt, …, <eos>]
-    - On each __getitem__ randomly samples a shift from {-2,-1,0,1,2}
-- make_collate_fn(pad_id)
+        - `note_*` — MIDI number ± shift, back to letter name
+        - `key_*` — circle-of-fifths shift (e.g. G major +1 → Ab major)
+        - `bass_*` / `chord_*` — pitch-class rotation, quality unchanged
+- `ScorePairDataset`
+    - Loads all pairs from pairs.jsonl
+    - Builds encoder/decoder sequences per paper Fig. 2b: `src = [Dsrc, Dtgt, …, <eos>]`, `tgt = [<sos>, Dtgt, …, <eos>]`
+    - On each `__getitem__` randomly samples a shift from {-2,-1,0,1,2}
+- `make_collate_fn(pad_id)`
     - Returns a collate function that pads and splits the target into:
-        - tgt_in = tgt[:-1] (decoder input, teacher-forced)
-        - tgt_out = tgt[1:] (cross-entropy target)
-- make_splits(pairs_path, vocab_path)
-    - Song-level train/val split so no song leaks across splits (default 5% val → ~2,100 / 57,000 pairs).
+        - `tgt_in = tgt[:-1]` (decoder input, teacher-forced)
+        - `tgt_out = tgt[1:]` (cross-entropy target)
+- `make_splits(pairs_path, vocab_path)`
+    - Song-level train/val split so no song leaks across splits (default 5% val)
 - **Status: DONE**
 
 ---
@@ -186,21 +203,32 @@ greedy_decode() — batched greedy decoding used by infer.py later
 - Teacher forcing on target sequence
 - Validation loss tracking, early stopping
 - Checkpoint saving (best model by validation loss)
-- LR schedule — make_lr_lambda: linear warmup over --warmup_steps steps, then cosine decay to --min_lr
+- LR schedule — `make_lr_lambda`: linear warmup over `--warmup_steps` steps, then cosine decay to `--min_lr`
 - Training loop
-    - Teacher forcing: tgt_in = tgt[:-1] → model → compared against tgt_out = tgt[1:]
-    - F.cross_entropy with ignore_index=pad_id (pad positions don't contribute to loss)
-    - label_smoothing=0.1 (helps regularization on a small dataset)
-    - Gradient clipping at grad_clip=1.0
-    - Gradient accumulation (--accum_steps, default 4) — effective batch = batch_size × accum_steps without extra VRAM
+    - Teacher forcing: `tgt_in = tgt[:-1]` → model → compared against `tgt_out = tgt[1:]`
+    - `F.cross_entropy` with `ignore_index=pad_id` (pad positions don't contribute to loss)
+    - `label_smoothing=0.1` (helps regularization on a small dataset)
+    - Gradient clipping at `grad_clip=1.0`
+    - Gradient accumulation (`--accum_steps`, default 4) — effective batch = batch_size × accum_steps without extra VRAM
     - Per-batch tqdm bar showing running loss + current LR
 - Checkpointing
-    - best.pt — saved whenever val loss improves (stores model, optimizer, scheduler state for resuming)
-    - epoch_NNNN.pt — periodic snapshot every --save_every epochs (default 10)
-    - train_log.csv — append-only CSV with epoch, train loss, val loss, lr, elapsed time
-- Early stopping — stops after --patience consecutive epochs (default 10) with no val improvement
-- Resuming — --resume data/checkpoints/best.pt restores full state and continues from next epoch
-- **Status: IN PROGRESS**
+    - `best.pt` — saved whenever val loss improves (stores model, optimizer, scheduler state for resuming)
+    - `epoch_NNNN.pt` — periodic snapshot every `--save_every` epochs (default 10)
+    - `train_log.csv` — append-only CSV with epoch, train loss, val loss, lr, elapsed time
+- Early stopping — stops after `--patience` consecutive epochs (default 10) with no val improvement
+- Resuming — `--resume data/checkpoints/best.pt` restores full state and continues from next epoch
+
+**Round 1 training results (noisy pairs):**
+- Trained 60 epochs, val_loss = 1.24, LR decayed to minimum (1e-5)
+- Output was musically valid in structure but did not sound like the same song as the input
+- Root cause: training pairs matched by song title only, not musical content
+
+**Round 2 plan (after reprocessing with compatibility filter):**
+- Run `python build_pairs.py` to regenerate `pairs.jsonl` with key/time/density filter
+- Train from scratch: `python train_seq2seq.py --epochs 100 --lr 1e-3`
+- Training from scratch (not resuming) is preferred since the data distribution changes significantly
+
+- **Status: Round 1 DONE, Round 2 pending dataset reprocessing**
 
 ---
 
@@ -211,7 +239,46 @@ greedy_decode() — batched greedy decoding used by infer.py later
 - Accept input MXL + target difficulty level
 - Tokenize – prepend conditioning – run model – detokenize
 - Output rearranged MXL file
-- **Status: TODO**
+
+- Pipeline:
+  ```
+  Input MXL
+     ↓ MusicXML_to_tokens()     tokenize to ST+ format
+     ↓ split_into_bars()        split into per-bar lists
+     ↓ assign_level()           detect source difficulty (Lv.1–4)
+     ↓ non-overlapping chunks   --seg_len bars each (default 8)
+     ↓ encode_segment()         prepend [Dsrc, Dtgt, ..., <eos>]
+     ↓ model.greedy_decode()    autoregressive generation
+     ↓ strip Dtgt token         remove conditioning prefix from output
+     ↓ concatenate segments     stitch all bars back together
+     ↓ tokens_to_score()        music21 Score
+     ↓ score.write('musicxml')  output .mxl
+  Output MXL
+  ```
+
+- Key arguments:
+  ```
+  --input       Input MXL or XML file (required)
+  --output      Output MXL file (required)
+  --level       Target difficulty: Lv.1 / Lv.2 / Lv.3 / Lv.4 (required)
+  --checkpoint  Model checkpoint (default: data/checkpoints/best.pt)
+  --seg_len     Bars per segment (default: 8, range: 4–8)
+  --temperature Sampling temperature (default: 1.2; higher = more varied)
+  --top_k       Top-k sampling (default: 10; 0 = greedy argmax)
+  --device      Device override (default: auto-detect CUDA)
+  ```
+
+- Inference improvements over naive greedy decode:
+    - **Forced Dtgt** (`init_token_idx`) — the target level token is injected directly into the decoder prefix, preventing the model from predicting the wrong difficulty level as its first token
+    - **Top-k sampling** (`top_k=10, temperature=1.2`) — breaks the greedy repetition collapse where the model would output the same note hundreds of times
+
+- Usage:
+  ```bash
+  python infer.py --input mxl/X/XX/Qm....mxl --output output.mxl --level Lv.1
+  python infer.py --input mxl/X/XX/Qm....mxl --output output.mxl --level Lv.1 --temperature 0.8 --top_k 5
+  ```
+
+- **Status: DONE**
 
 ---
 
@@ -252,8 +319,12 @@ score-rearrangement/
     tokens/                      tokenized JSON files (output of 1.1)
     data/
         pairs.jsonl              training pairs (output of 1.2)
+        score_list.csv           per-score difficulty table (output of list_scores.py)
         vocab.json               vocabulary (output of 1.3)
         checkpoints/             saved model weights
+            best.pt              best checkpoint by val loss
+            epoch_NNNN.pt        periodic snapshots
+            train_log.csv        epoch-by-epoch training log
     score_to_tokens.py           MXL → ST+ tokens
     tokens_to_score.py           ST+ tokens → MXL
     tokenize_all.py              batch tokenization [Phase 1.1]
@@ -264,8 +335,9 @@ score-rearrangement/
     train_seq2seq.py             training script [Phase 3.1]
     infer.py                     inference script [Phase 4.1]
     evaluate.py                  evaluation metrics [Phase 5.1]
+    list_scores.py               generates score_list.csv for test score selection
     PDMX.csv                     PDMX metadata
-    Score Rearrangement-Project Specification.md
+    ScoreRearrangement-ProjectSpecification.md
 ```
 
 ---
