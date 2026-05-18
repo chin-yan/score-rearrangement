@@ -1,0 +1,15 @@
+# Score Rearrangement project dependencies (Phases 1-6)
+# Install with:
+#   python -m venv .venv
+#   .venv\Scripts\Activate.ps1   (PowerShell)  or  .venv\Scripts\activate.bat
+#   pip install -r requirements.txt
+
+# Music XML parsing & note utilities
+beautifulsoup4>=4.12
+lxml>=5.0
+music21>=9.1
+pretty_midi>=0.2.10
+
+# Modeling & training
+torch>=2.2
+tqdm>=4.66
