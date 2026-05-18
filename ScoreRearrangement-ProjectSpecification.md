@@ -292,22 +292,36 @@ Score pairs are trained **bidirectionally** (easier→harder and harder→easier
 
 ---
 
-### Phase 6 — Cross-Instrument Extension (Piano ↔ Violin)
+### Phase 6 — AI Auto-Orchestration & Cross-Instrument Extension (Piano ➔ Duet)
+**[6.1] Expand Data Processing & Reverse Augmentation (tokenize_duet.py)**
 
-**[6.1] Expand `tokenize_all.py`**
-- Also tokenize violin scores (MIDI program = 40) from PDMX
-- Handle single-staff (R only) format for violin
-- **Status: TODO** (pending Phase 1–5 completion)
+Extract 1,600+ "Piano + Violin" duet scores (MIDI program 0 and 40) from PDMX.
 
-**[6.2] Expand `build_pairs.py`**
-- Match same-song piano+violin pairs (141 songs / 1,381 pairs in PDMX — insufficient alone)
-- Supplement with external datasets (e.g., IMSLP) for more paired data
-- **Status: TODO** (requires additional data sourcing)
+Implement track splitting to isolate [Violin Melody] and [Piano Accompaniment].
 
-**[6.3] Update `model.py` conditioning tokens**
-- Change conditioning from `{Dsrc, Dtgt}` to `{Isrc_Dsrc, Itgt_Dtgt}`
-- e.g., `piano_Lv3 violin_Lv1` as combined instrument+difficulty tokens
-- **Status: TODO**
+Implement Reverse Data Augmentation: Merge the violin melody tokens into the piano accompaniment track to synthesize complex [Pseudo Piano Solo] scores as the source input.
+
+* Status: TODO (pending Phase 1–5 completion)
+
+**[6.2] Expand Pair Building (build_pairs.py)**
+
+Construct perfectly aligned training pairs utilizing the synthesized data (bypassing the need for external datasets):
+
+Dataset A (Melody Extraction): [Pseudo Piano Solo] ➔ [Violin Melody]
+
+Dataset B (Auto-Orchestration): [Pseudo Piano Solo] ➔ [Original Duet (Violin + Piano)]
+
+* Status: TODO
+
+**[6.3] Update Model & Vocabulary (model.py & vocab.json)**
+
+Update vocab.json with new track-specific tokens (e.g., <track_violin>, <track_piano>) to support multi-track output.
+
+Adjust the Seq2Seq Transformer to handle sequence translation and feature decoupling (Track Allocation).
+
+Train new model weights from scratch for the Orchestration task, learning to automatically expand a single piano solo into a duet.
+
+* Status: TODO
 
 ---
 
