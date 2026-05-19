@@ -299,17 +299,31 @@ Section 2.1 concluded that cross-instrument training was infeasible because only
 
 **[6.1] Duet Data Processing & Reverse Augmentation (`tokenize_duet.py`)**
 
-- Filter PDMX to scores whose `tracks` column contains both `0` (piano) and `40` (violin). Confirmed count: **1,629 duet scores**.
-  - Note: these are not strictly 2-track. Many are `0-40`, but others are `0-40-40`, `0-40-41-42`, etc. (extra violin doubles, viola, cello, …). Decide handling per case:
-    - Keep all piano tracks (program 0) → merge into one piano part.
-    - Keep all violin tracks (program 40) → merge into one violin melody part.
-    - Discard other programs (41/42/…) for the first iteration; revisit in a later experiment.
+- Filter PDMX to scores whose `tracks` column contains both `0` (piano) and `40` (violin). Verified against `PDMX.csv` (254,077 rows total): **1,890 scores match**.
+- Composition of those 1,890 scores (important — they are mostly NOT pure duets):
+
+  | Class | Count | Share |
+  |---|---:|---:|
+  | Contains other instruments (e.g. `0-40-41-42`, chamber / small orchestra) | 1,508 | 79.8% |
+  | Pure piano + violin (`0-40` exactly) | 315 | 16.7% |
+  | Piano / violin doublings only (e.g. `0-40-40`, `0-0-40`) | 67 | 3.5% |
+
+  Top co-occurring programs alongside piano+violin: viola (41), cello (42), flute (73), trumpet (56) — meaning many of the 1,890 are actually string quartets or small-ensemble arrangements rather than literal duets.
+
+- **Decision: use all 1,890 scores (Option B), discard non-0 / non-40 tracks at preprocessing time.**
+  - For each score, pick the **first** program-0 part as the piano, and the **first** program-40 part as the violin melody.
+  - For `0-40-40` (two violins): use Violin 1 only. Merging multiple violins into one melody line is left as a v2 extension — the first iteration keeps the task definition clean ("expand piano solo into piano + one violin melody").
+  - For `0-0-40` and similar (multiple pianos): use the first piano part only.
+  - **Drop** all other programs (41, 42, 73, …) entirely — do NOT fold viola/cello into the piano, since that would make the synthesized Pseudo Piano Solo unplayable and worsen the train/test distribution gap.
+  - Trade-off acknowledged: dropping viola/cello means we lose harmonic information present in the original chamber score, but the goal here is to learn piano↔violin orchestration, not full chamber reduction.
 - Run `MusicXML_to_tokens()` per track to isolate **[Violin Melody]** and **[Piano Accompaniment]** as separate token streams.
 - **Reverse Data Augmentation** — synthesize a **[Pseudo Piano Solo]** by merging violin melody tokens into the piano accompaniment track:
   - Align by bar/onset, merge violin pitches into the piano right hand as additional chord notes (or as a separate voice, then flatten).
   - **Normalization step (critical to close the train/test distribution gap):** after merging, re-run hand assignment, re-collapse simultaneous notes into chords, and strip duet-only voice markers so the pseudo solo looks like a token sequence a real piano-solo score would produce. Without this, the model overfits to the synthetic "violin stacked on piano" pattern and fails on real piano-solo inputs at inference time.
-- Output: per-score `{piano_solo_pseudo, piano_accomp, violin_melody, duet_full}` token JSONs under `tokens_duet/`.
-- **Status:** TODO (pending Phase 1–5 completion)
+- Output: per-score `{piano, violin, n_bars, tracks}` token JSONs under `Phase06/tokens_duet/`.
+- Pseudo-solo synthesis is **deferred to Phase 6.2** (`build_pairs_duet.py`), so we can iterate on the merging strategy without re-tokenizing 1,890 MXLs.
+- **Actual results (run 2026-05-18):** 1,735 / 1,890 scores tokenized successfully (91.8%). 65.1 MB total output. 151,475 bars across all duets; median 64 bars/score. 155 failures dominated by upstream `score_to_tokens.aggregate_notes()` raising `Cannot insert None into a tag` on edge-case notations — not worth chasing for first iteration.
+- **Status:** DONE (selective extraction + per-track tokenization). Code: `Phase06/extract_duet_mxl.py`, `Phase06/tokenize_duet.py`.
 
 **[6.2] Duet Pair Building (`build_pairs_duet.py`)**
 
