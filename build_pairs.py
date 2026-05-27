@@ -265,7 +265,7 @@ def main():
     print("Loading CSV and matching to token files...")
     song_to_scores = defaultdict(list)
 
-    with open(CSV_PATH, encoding='utf-8') as f:
+    with open(CSV_PATH, encoding='utf-8', errors='replace') as f:
         for row in csv.DictReader(f):
             tracks = row['tracks'].strip()
             song   = row['song_name'].strip()
