@@ -18,7 +18,7 @@ Pipeline:
        ↓ [Dsrc, Dtgt] prepend    difficulty conditioning
        ↓ model.greedy_decode()    autoregressive generation
        ↓ strip Dtgt token         remove conditioning prefix from output
-       ↓ validate segment         fall back to source if 'bar'/'R' missing
+       ↓ validate every bar       fall back to source if any bar lacks 'R'
        ↓ concatenate segments     stitch all segments back together
        ↓ tokens_to_score()        detokenize to music21 Score
     Output MXL
@@ -74,11 +74,25 @@ def ids_to_tokens(id_list, id_to_token):
 
 def is_valid_segment(tokens):
     """
-    Return True if the token list is a structurally valid ST+ segment.
-    Requires at least one 'bar' separator and at least one 'R' hand marker.
-    Without these tokens_to_score will raise list.index(x): x not in list.
+    Return True if every individual bar in the token list has an 'R' hand marker.
+
+    tokens_to_score calls to_ST which splits on 'bar' and then calls
+    split_header_R_L on each bar's content — a single bar missing 'R'
+    causes list.index(x): x not in list even if the rest of the segment
+    is fine.  We must check every bar, not just the segment as a whole.
     """
-    return 'bar' in tokens and 'R' in tokens
+    bars = []
+    current = []
+    for t in tokens:
+        if t == 'bar':
+            if current:
+                bars.append(current)
+            current = []
+        else:
+            current.append(t)
+    if current:
+        bars.append(current)
+    return bool(bars) and all('R' in bar for bar in bars)
 
 
 # ---------------------------------------------------------------------------
@@ -227,9 +241,9 @@ def main():
         if decoded_tokens and decoded_tokens[0] == tgt_level:
             decoded_tokens = decoded_tokens[1:]
 
-        # Validate: the output must have at least one 'bar' and one 'R' token
-        # so that tokens_to_score can parse it.  Fall back to the source segment
-        # (pass-through) when the model produces a malformed sequence.
+        # Validate every bar: to_ST splits on 'bar' and calls split_header_R_L
+        # per bar, so a single bar missing 'R' inside an otherwise-valid segment
+        # will still crash.  Fall back to the source segment on any failure.
         if not is_valid_segment(decoded_tokens):
             n_fallback += 1
             decoded_tokens = seg_tokens
@@ -242,7 +256,7 @@ def main():
 
     if n_fallback:
         print(f'  Note: {n_fallback}/{n_segs} segment(s) used source pass-through '
-              f'(model output lacked bar/R structure).')
+              f'(model output had bars missing R hand marker).')
 
     if not all_output_tokens:
         print('Error: model produced no output tokens.', file=sys.stderr)
@@ -254,8 +268,7 @@ def main():
         score = tokens_to_score(all_output_tokens)
     except Exception as e:
         print(f'Error detokenizing: {e}', file=sys.stderr)
-        print('This may indicate the model output is still structurally malformed.', file=sys.stderr)
-        print('Try reducing --seg_len (e.g. --seg_len 4) or --temperature (e.g. --temperature 1.0).', file=sys.stderr)
+        print('Try --temperature 1.0 --top_k 0 for stricter greedy decoding.', file=sys.stderr)
         sys.exit(1)
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
