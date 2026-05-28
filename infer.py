@@ -5,9 +5,9 @@ Rearranges an input MXL piano score to a target difficulty level using
 the trained seq2seq Transformer.
 
 Usage:
-    python infer.py input.mxl output.mxl --level Lv.2
-    python infer.py input.mxl output.mxl --level Lv.1 --checkpoint data/checkpoints/best.pt
-    python infer.py input.mxl output.mxl --level Lv.3 --seg_len 6 --device cuda:0
+    python infer.py --input input.mxl --output output.mxl --level Lv.2
+    python infer.py --input input.mxl --output output.mxl --level Lv.1 --checkpoint data/checkpoints/best.pt
+    python infer.py --input input.mxl --output output.mxl --level Lv.3 --seg_len 6 --device cuda:0
 
 Pipeline:
     Input MXL
@@ -18,6 +18,7 @@ Pipeline:
        ↓ [Dsrc, Dtgt] prepend    difficulty conditioning
        ↓ model.greedy_decode()    autoregressive generation
        ↓ strip Dtgt token         remove conditioning prefix from output
+       ↓ validate segment         fall back to source if 'bar'/'R' missing
        ↓ concatenate segments     stitch all segments back together
        ↓ tokens_to_score()        detokenize to music21 Score
     Output MXL
@@ -69,6 +70,15 @@ def encode_segment(bar_tokens, src_level, tgt_level, token_to_id, eos_id):
 def ids_to_tokens(id_list, id_to_token):
     """Convert a list of integer token IDs to token strings."""
     return [id_to_token[i] for i in id_list if i in id_to_token]
+
+
+def is_valid_segment(tokens):
+    """
+    Return True if the token list is a structurally valid ST+ segment.
+    Requires at least one 'bar' separator and at least one 'R' hand marker.
+    Without these tokens_to_score will raise list.index(x): x not in list.
+    """
+    return 'bar' in tokens and 'R' in tokens
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +192,11 @@ def main():
         print('  Warning: source and target levels are the same — output may be unchanged.')
 
     # ── segment → model → collect outputs ─────────────────────────────────
-    seg_len = max(4, min(args.seg_len, 8))
-    starts  = list(range(0, len(bars), seg_len))
-    print(f'\nRunning model: {len(starts)} segment(s), up to {seg_len} bars each')
+    seg_len   = max(4, min(args.seg_len, 8))
+    starts    = list(range(0, len(bars), seg_len))
+    n_segs    = len(starts)
+    n_fallback = 0
+    print(f'\nRunning model: {n_segs} segment(s), up to {seg_len} bars each')
 
     all_output_tokens = []
 
@@ -193,17 +205,17 @@ def main():
         seg_tokens = bars_to_tokens(seg_bars)
 
         src_ids    = encode_segment(seg_tokens, src_level, tgt_level, token_to_id, eos_id)
-        src_tensor = torch.tensor([src_ids], dtype=torch.long, device=device)  # (1, src_len)
+        src_tensor = torch.tensor([src_ids], dtype=torch.long, device=device)
 
         decoded_ids = model.greedy_decode(
             src_tensor,
             sos_id,
             eos_id,
             max_len=args.max_decode_len,
-            init_token_idx=token_to_id[tgt_level],  # force Dtgt as first output token
+            init_token_idx=token_to_id[tgt_level],
             temperature=args.temperature,
             top_k=args.top_k,
-        )[0]  # batch of 1 → take first item
+        )[0]
 
         decoded_tokens = ids_to_tokens(decoded_ids, id_to_token)
 
@@ -211,10 +223,22 @@ def main():
         if decoded_tokens and decoded_tokens[0] == tgt_level:
             decoded_tokens = decoded_tokens[1:]
 
+        # Validate: the output must have at least one 'bar' and one 'R' token
+        # so that tokens_to_score can parse it.  Fall back to the source segment
+        # (pass-through) when the model produces a malformed sequence.
+        if not is_valid_segment(decoded_tokens):
+            n_fallback += 1
+            decoded_tokens = seg_tokens
+
         all_output_tokens.extend(decoded_tokens)
 
-        if (seg_idx + 1) % 10 == 0 or (seg_idx + 1) == len(starts):
-            print(f'  [{seg_idx + 1}/{len(starts)}]  output tokens so far: {len(all_output_tokens)}')
+        if (seg_idx + 1) % 10 == 0 or (seg_idx + 1) == n_segs:
+            print(f'  [{seg_idx + 1}/{n_segs}]  output tokens so far: {len(all_output_tokens)}'
+                  + (f'  (fallbacks so far: {n_fallback})' if n_fallback else ''))
+
+    if n_fallback:
+        print(f'  Note: {n_fallback}/{n_segs} segment(s) used source pass-through '
+              f'(model output lacked bar/R structure).')
 
     if not all_output_tokens:
         print('Error: model produced no output tokens.', file=sys.stderr)
@@ -226,6 +250,8 @@ def main():
         score = tokens_to_score(all_output_tokens)
     except Exception as e:
         print(f'Error detokenizing: {e}', file=sys.stderr)
+        print('This may indicate the model output is still structurally malformed.', file=sys.stderr)
+        print('Try reducing --seg_len (e.g. --seg_len 4) or --temperature (e.g. --temperature 1.0).', file=sys.stderr)
         sys.exit(1)
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
