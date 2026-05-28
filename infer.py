@@ -5,9 +5,9 @@ Rearranges an input MXL piano score to a target difficulty level using
 the trained seq2seq Transformer.
 
 Usage:
-    python infer.py input.mxl output.mxl --level Lv.2
-    python infer.py input.mxl output.mxl --level Lv.1 --checkpoint data/checkpoints/best.pt
-    python infer.py input.mxl output.mxl --level Lv.3 --seg_len 6 --device cuda:0
+    python infer.py --input input.mxl --output output.mxl --level Lv.2
+    python infer.py --input input.mxl --output output.mxl --level Lv.1 --checkpoint data/checkpoints/best.pt
+    python infer.py --input input.mxl --output output.mxl --level Lv.3 --seg_len 6 --device cuda:0
 
 Pipeline:
     Input MXL
@@ -18,6 +18,7 @@ Pipeline:
        ↓ [Dsrc, Dtgt] prepend    difficulty conditioning
        ↓ model.greedy_decode()    autoregressive generation
        ↓ strip Dtgt token         remove conditioning prefix from output
+       ↓ validate every bar       fall back to source if any bar is malformed
        ↓ concatenate segments     stitch all segments back together
        ↓ ensure_clefs()           inject clef_treble/clef_bass if missing
        ↓ tokens_to_score()        detokenize to music21 Score
@@ -37,7 +38,11 @@ from tokens_to_score import tokens_to_score
 from build_pairs import split_into_bars, bars_to_tokens, assign_level
 
 
-VALID_LEVELS = ('Lv.1', 'Lv.2', 'Lv.3', 'Lv.4')
+VALID_LEVELS  = ('Lv.1', 'Lv.2', 'Lv.3', 'Lv.4')
+MAX_SRC_LEN   = 1024   # must match PositionalEncoding max_len in model.py
+
+# Tokens that are part of a note group but are not the note/len themselves
+_NOTE_GROUP_CONTINUATIONS = {'stem', 'beam', 'tie', 'staccato', 'accent', 'tenuto'}
 
 
 # ---------------------------------------------------------------------------
@@ -50,12 +55,19 @@ def encode_segment(bar_tokens, src_level, tgt_level, token_to_id, eos_id):
         [Dsrc, Dtgt, <segment_tokens...>, <eos>]
 
     Tokens not present in the vocabulary are silently skipped.
+    If the result exceeds MAX_SRC_LEN, the middle tokens are truncated
+    while keeping the conditioning prefix and the <eos> suffix intact.
     """
     ids = [token_to_id[src_level], token_to_id[tgt_level]]
     for tok in bar_tokens:
         if tok in token_to_id:
             ids.append(token_to_id[tok])
     ids.append(eos_id)
+
+    # Truncate to positional encoding limit: keep [Dsrc, Dtgt, ...truncated..., <eos>]
+    if len(ids) > MAX_SRC_LEN:
+        ids = ids[:MAX_SRC_LEN - 1] + [eos_id]
+
     return ids
 
 
@@ -64,58 +76,59 @@ def ids_to_tokens(id_list, id_to_token):
     return [id_to_token[i] for i in id_list if i in id_to_token]
 
 
-def ensure_clefs(tokens):
+def _bar_is_valid(bar_tokens):
     """
-    Post-processing: ensure the FIRST bar has correct clef tokens.
-
-    MusicXML only writes clef tokens when they change, so usually only
-    the first bar has them. The model often omits even that.
-    tokens_to_score() carries the last-seen clef forward, so we only
-    need to inject clef_treble (R) and clef_bass (L) in the first bar.
-    Subsequent bars do NOT get clef tokens injected to avoid rendering
-    a clef symbol at every barline.
+    Return True if a single bar's token list is structurally valid:
+      1. Has at least one 'R' hand marker (required by split_header_R_L).
+      2. Every note/rest group has at least one 'len_' token before the
+         group ends — mirrors the same group-boundary logic used by
+         group_related_tokens in tokens_to_score.py so that note_token_to_obj
+         never receives an empty lengths list (which causes IndexError).
     """
-    result = []
-    i = 0
-    toks = tokens
-    first_bar_done = False
+    if 'R' not in bar_tokens:
+        return False
 
-    while i < len(toks):
-        if toks[i] != 'bar':
-            result.append(toks[i])
-            i += 1
-            continue
+    in_note = False
+    has_len = False
+    for t in bar_tokens:
+        prefix = t.split('_')[0]
+        if prefix in ('note', 'rest'):
+            if in_note and not has_len:
+                return False          # previous group had no length
+            in_note = True
+            has_len = False
+        elif prefix == 'len':
+            has_len = True
+        elif prefix in _NOTE_GROUP_CONTINUATIONS or t in ('slur_start', 'slur_stop'):
+            pass                      # still inside the note group
+        else:
+            if in_note and not has_len:
+                return False          # group ended without a length
+            in_note = False
+            has_len = False
 
-        # Collect entire bar block
-        bar_block = ['bar']
-        i += 1
-        while i < len(toks) and toks[i] != 'bar':
-            bar_block.append(toks[i])
-            i += 1
+    if in_note and not has_len:
+        return False                  # last group in bar had no length
+    return True
 
-        # Only inject clefs in the first bar
-        if not first_bar_done:
-            # R section: inject clef_treble after R if missing
-            if 'R' in bar_block:
-                r_idx = bar_block.index('R')
-                l_idx = bar_block.index('L') if 'L' in bar_block else len(bar_block)
-                r_section = bar_block[r_idx + 1: l_idx]
-                if not any(t == 'clef_treble' for t in r_section):
-                    bar_block.insert(r_idx + 1, 'clef_treble')
-                    l_idx = bar_block.index('L') if 'L' in bar_block else len(bar_block)
 
-            # L section: inject clef_bass after L if missing
-            if 'L' in bar_block:
-                l_idx = bar_block.index('L')
-                l_section = bar_block[l_idx + 1:]
-                if not any(t == 'clef_bass' for t in l_section):
-                    bar_block.insert(l_idx + 1, 'clef_bass')
-
-            first_bar_done = True
-
-        result.extend(bar_block)
-
-    return result
+def is_valid_segment(tokens):
+    """
+    Return True if every bar in the decoded segment is structurally valid.
+    Falls back to source if any bar fails _bar_is_valid.
+    """
+    bars = []
+    current = []
+    for t in tokens:
+        if t == 'bar':
+            if current:
+                bars.append(current)
+            current = []
+        else:
+            current.append(t)
+    if current:
+        bars.append(current)
+    return bool(bars) and all(_bar_is_valid(b) for b in bars)
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +184,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Strip accidental whitespace from file paths (Windows path errors if present)
+    args.input  = args.input.strip()
+    args.output = args.output.strip()
 
     # ── device ────────────────────────────────────────────────────────────
     if args.device:
@@ -229,9 +246,11 @@ def main():
         print('  Warning: source and target levels are the same — output may be unchanged.')
 
     # ── segment → model → collect outputs ─────────────────────────────────
-    seg_len = max(4, min(args.seg_len, 8))
-    starts  = list(range(0, len(bars), seg_len))
-    print(f'\nRunning model: {len(starts)} segment(s), up to {seg_len} bars each')
+    seg_len    = max(4, min(args.seg_len, 8))
+    starts     = list(range(0, len(bars), seg_len))
+    n_segs     = len(starts)
+    n_fallback = 0
+    print(f'\nRunning model: {n_segs} segment(s), up to {seg_len} bars each')
 
     all_output_tokens = []
 
@@ -258,10 +277,21 @@ def main():
         if decoded_tokens and decoded_tokens[0] == tgt_level:
             decoded_tokens = decoded_tokens[1:]
 
+        # Validate every bar: requires 'R' in each bar AND every note/rest
+        # group must have a len_ token, otherwise note_token_to_obj crashes.
+        if not is_valid_segment(decoded_tokens):
+            n_fallback += 1
+            decoded_tokens = seg_tokens
+
         all_output_tokens.extend(decoded_tokens)
 
-        if (seg_idx + 1) % 10 == 0 or (seg_idx + 1) == len(starts):
-            print(f'  [{seg_idx + 1}/{len(starts)}]  output tokens so far: {len(all_output_tokens)}')
+        if (seg_idx + 1) % 10 == 0 or (seg_idx + 1) == n_segs:
+            print(f'  [{seg_idx + 1}/{n_segs}]  output tokens so far: {len(all_output_tokens)}'
+                  + (f'  (fallbacks so far: {n_fallback})' if n_fallback else ''))
+
+    if n_fallback:
+        print(f'  Note: {n_fallback}/{n_segs} segment(s) used source pass-through '
+              f'(model output had bars with missing R or note-length tokens).')
 
     if not all_output_tokens:
         print('Error: model produced no output tokens.', file=sys.stderr)
@@ -277,6 +307,7 @@ def main():
         score = tokens_to_score(all_output_tokens)
     except Exception as e:
         print(f'Error detokenizing: {e}', file=sys.stderr)
+        print('Try --temperature 1.0 --top_k 0 for stricter greedy decoding.', file=sys.stderr)
         sys.exit(1)
 
     out_dir = os.path.dirname(os.path.abspath(args.output))
