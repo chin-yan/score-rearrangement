@@ -135,6 +135,10 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Strip accidental whitespace from file paths (Windows path errors if present)
+    args.input  = args.input.strip()
+    args.output = args.output.strip()
+
     # ── device ────────────────────────────────────────────────────────────
     if args.device:
         device = torch.device(args.device)
@@ -192,9 +196,9 @@ def main():
         print('  Warning: source and target levels are the same — output may be unchanged.')
 
     # ── segment → model → collect outputs ─────────────────────────────────
-    seg_len   = max(4, min(args.seg_len, 8))
-    starts    = list(range(0, len(bars), seg_len))
-    n_segs    = len(starts)
+    seg_len    = max(4, min(args.seg_len, 8))
+    starts     = list(range(0, len(bars), seg_len))
+    n_segs     = len(starts)
     n_fallback = 0
     print(f'\nRunning model: {n_segs} segment(s), up to {seg_len} bars each')
 
